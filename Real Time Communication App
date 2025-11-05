@@ -1,0 +1,170 @@
+# Real-Time Communication App — Full Starter (Express + Socket.io + WebRTC)
+
+This is a **ready-to-run starter** for a real-time communication app that includes:
+
+* Multi-user **video conferencing** (mesh topology)
+* **Screen sharing** (getDisplayMedia)
+* **File sharing** via WebRTC DataChannel (and optional server fallback)
+* **Shared whiteboard** (canvas broadcast via Socket.io)
+* **User authentication** (JWT) + secure Socket.io connection
+* Basic **data encryption** notes (WebRTC media is DTLS-SRTP encrypted; include E2EE notes)
+
+This starter is designed for learning and small-group usage. For production you'll want to add TURN servers, HTTPS, and an SFU for scale.
+
+---
+
+## Project layout
+
+```
+rtc-collab-starter/
+├─ package.json
+├─ server.js
+├─ README.md
+├─ config.example.json
+└─ public/
+   ├─ index.html
+   ├─ room.html
+   ├─ css/style.css
+   └─ js/app.js
+```
+
+---
+
+## Quick start (development)
+
+1. Install Node 16+ and npm.
+2. `npm install`
+3. `node server.js`
+4. Open `http://localhost:3000` in two+ tabs, register/login (optional), join the same room.
+
+> For real-world use: configure HTTPS and a TURN server (coturn). See the Security section.
+
+---
+
+## package.json
+
+```json
+{
+  "name": "rtc-collab-starter",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "helmet": "^7.0.0",
+    "jsonwebtoken": "^9.0.0",
+    "socket.io": "^4.7.2"
+  }
+}
+```
+
+---
+
+## config.example.json
+
+```json
+{
+  "JWT_SECRET": "replace-with-a-strong-secret",
+  "PORT": 3000,
+  "ICE_SERVERS": [
+    { "urls": "stun:stun.l.google.com:19302" }
+    /* Add TURN servers in production: { "urls": "turn:turn.example.org:3478", "username":"user", "credential":"pass" } */
+  ]
+}
+```
+
+---
+
+## server.js (Express + Socket.io + JWT auth)
+
+```javascript
+// server.js
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const http = require('http');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const helmet = require('helmet');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const { Server } = require('socket.io');
+
+const config = (() => {
+  try { return JSON.parse(fs.readFileSync('./config.json')); } catch (e) { return JSON.parse(fs.readFileSync('./config.example.json')); }
+})();
+
+const JWT_SECRET = config.JWT_SECRET || 'dev-secret';
+const PORT = process.env.PORT || config.PORT || 3000;
+const ICE_SERVERS = config.ICE_SERVERS || [{ urls: 'stun:stun.l.google.com:19302' }];
+
+const app = express();
+app.use(helmet());
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// In-memory user store for demo — replace with DB in prod
+const users = {}; // username -> { passwordHash, id }
+
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Missing' });
+  if (users[username]) return res.status(409).json({ error: 'User exists' });
+  const hash = await bcrypt.hash(password, 10);
+  users[username] = { passwordHash: hash, id: username };
+  const token = jwt.sign({ sub: username }, JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token, username });
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = users[username];
+  if (!user) return res.status(401).json({ error: 'Invalid' });
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: 'Invalid' });
+  const token = jwt.sign({ sub: username }, JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token, username });
+});
+
+// Provide ICE servers config to clients
+app.get('/api/ice', (req, res) => res.json({ iceServers: ICE_SERVERS }));
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+
+// Simple rooms state
+const rooms = new Map();
+
+// Socket auth middleware (accepts anonymous if no token)
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    socket.user = { username: payload.sub };
+    return next();
+  } catch (err) {
+    return next(new Error('Authentication error'));
+  }
+});
+
+io.on('connection', (socket) => {
+  console.log('socket connected', socket.id, socket.user?.username || 'anon');
+
+  socket.on('join-room', ({ roomId, username }) => {
+    socket.join(roomId);
+    socket.roomId = roomId;
+    socket.username = username || socket.user?.username || 'anon';
+
+    // notify others
+    socket.to(roomId).emit('peer-joined', { socketId: socket.id, username: socket.username });
+
+    // send existing clients to newcomer
+    const clients = Array.from(io.sockets.adapter.rooms.get(roomId) || []).filter(id => id !
+```
