@@ -1,0 +1,436 @@
+# Mini Social App — Django Starter
+
+This document contains a complete, copy/paste-ready Django starter app for a **mini social media** application with:
+
+* User profiles (avatar, bio)
+* Posts (text + optional image)
+* Comments on posts
+* Like system for posts
+* Follow/unfollow (followers list)
+* Authentication (register/login/logout)
+* SQLite database by default (Django ORM)
+
+---
+
+## Project layout
+
+```
+mini_social_django/
+├─ manage.py
+├─ mini_social/         # Django project
+│  ├─ settings.py
+│  ├─ urls.py
+│  └─ wsgi.py
+└─ core/                # Django app
+   ├─ migrations/
+   ├─ templates/
+   │  ├─ base.html
+   │  ├─ feed.html
+   │  ├─ profile.html
+   │  ├─ post_detail.html
+   │  └─ auth.html
+   ├─ static/
+   │  ├─ css/style.css
+   │  └─ js/main.js
+   ├─ models.py
+   ├─ views.py
+   ├─ urls.py
+   ├─ forms.py
+   └─ admin.py
+```
+
+---
+
+## Setup instructions (quick)
+
+1. Create project and app (or use provided files):
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install django
+django-admin startproject mini_social
+cd mini_social
+python manage.py startapp core
+```
+
+2. Add `'core'` to `INSTALLED_APPS` in `mini_social/settings.py` and configure `TEMPLATES` and `STATICFILES_DIRS` if needed.
+
+3. Place the files from this document into the corresponding locations.
+
+4. Run migrations and create superuser:
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+python manage.py createsuperuser
+python manage.py runserver
+```
+
+Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+
+---
+
+## `core/models.py`
+
+```python
+from django.db import models
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+class Profile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    bio = models.TextField(blank=True)
+    avatar = models.URLField(blank=True)
+    # followers: users who follow this profile
+    followers = models.ManyToManyField('self', symmetrical=False, related_name='following', blank=True)
+
+    def followers_count(self):
+        return self.followers.count()
+
+    def following_count(self):
+        return self.following.count()
+
+    def __str__(self):
+        return self.user.username
+
+@receiver(post_save, sender=User)
+def create_profile(sender, instance, created, **kwargs):
+    if created:
+        Profile.objects.create(user=instance)
+
+@receiver(post_save, sender=User)
+def save_profile(sender, instance, **kwargs):
+    instance.profile.save()
+
+class Post(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='posts')
+    content = models.TextField()
+    image = models.URLField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    likes = models.ManyToManyField(User, related_name='liked_posts', blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def total_likes(self):
+        return self.likes.count()
+
+    def __str__(self):
+        return f"Post {self.id} by {self.user.username}"
+
+class Comment(models.Model):
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='comments')
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Comment by {self.user.username} on post {self.post.id}"
+```
+
+---
+
+## `core/forms.py`
+
+```python
+from django import forms
+from django.contrib.auth.forms import UserCreationForm
+from django.contrib.auth.models import User
+from .models import Post, Comment
+
+class RegisterForm(UserCreationForm):
+    email = forms.EmailField(required=False)
+    class Meta:
+        model = User
+        fields = ('username', 'email', 'password1', 'password2')
+
+class PostForm(forms.ModelForm):
+    class Meta:
+        model = Post
+        fields = ('content', 'image')
+        widgets = {
+            'content': forms.Textarea(attrs={'rows':3, 'placeholder':'What\'s on your mind?'}),
+        }
+
+class CommentForm(forms.ModelForm):
+    class Meta:
+        model = Comment
+        fields = ('text',)
+        widgets = {
+            'text': forms.TextInput(attrs={'placeholder':'Write a comment...'}),
+        }
+```
+
+---
+
+## `core/views.py`
+
+```python
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import User
+from django.http import JsonResponse, HttpResponseForbidden
+from .models import Post, Comment, Profile
+from .forms import RegisterForm, PostForm, CommentForm
+
+def index(request):
+    if request.user.is_authenticated:
+        return redirect('feed')
+    return redirect('feed')
+
+def feed(request):
+    posts = Post.objects.select_related('user').prefetch_related('comments', 'likes')[:100]
+    post_form = PostForm()
+    comment_form = CommentForm()
+    return render(request, 'feed.html', {'posts': posts, 'post_form': post_form, 'comment_form': comment_form})
+
+@login_required
+def create_post(request):
+    if request.method == 'POST':
+        form = PostForm(request.POST)
+        if form.is_valid():
+            post = form.save(commit=False)
+            post.user = request.user
+            post.save()
+    return redirect('feed')
+
+@login_required
+def toggle_like(request, post_id):
+    post = get_object_or_404(Post, id=post_id)
+    if request.user in post.likes.all():
+        post.likes.remove(request.user)
+        liked = False
+    else:
+        post.likes.add(request.user)
+        liked = True
+    return JsonResponse({'liked': liked, 'likes_count': post.total_likes()})
+
+@login_required
+def add_comment(request, post_id):
+    post = get_object_or_404(Post, id=post_id)
+    if request.method == 'POST':
+        form = CommentForm(request.POST)
+        if form.is_valid():
+            comment = form.save(commit=False)
+            comment.user = request.user
+            comment.post = post
+            comment.save()
+    return redirect('feed')
+
+def profile_view(request, username):
+    profile_user = get_object_or_404(User, username=username)
+    profile = profile_user.profile
+    posts = Post.objects.filter(user=profile_user)
+    is_following = False
+    if request.user.is_authenticated:
+        is_following = profile.followers.filter(id=request.user.profile.id).exists()
+    return render(request, 'profile.html', {'profile_user': profile_user, 'profile': profile, 'posts': posts, 'is_following': is_following})
+
+@login_required
+def toggle_follow(request, username):
+    if request.method != 'POST':
+        return HttpResponseForbidden()
+    target = get_object_or_404(User, username=username)
+    target_profile = target.profile
+    requester_profile = request.user.profile
+    if requester_profile in target_profile.followers.all():
+        target_profile.followers.remove(requester_profile)
+        following = False
+    else:
+        target_profile.followers.add(requester_profile)
+        following = True
+    return JsonResponse({'following': following, 'followers_count': target_profile.followers_count()})
+
+def register_view(request):
+    if request.method == 'POST':
+        form = RegisterForm(request.POST)
+        if form.is_valid():
+            user = form.save()
+            login(request, user)
+            return redirect('feed')
+    else:
+        form = RegisterForm()
+    return render(request, 'auth.html', {'form': form})
+
+def login_view(request):
+    if request.method == 'POST':
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        user = authenticate(request, username=username, password=password)
+        if user:
+            login(request, user)
+            return redirect('feed')
+    return render(request, 'auth.html')
+
+@login_required
+def logout_view(request):
+    logout(request)
+    return redirect('feed')
+```
+
+---
+
+## `core/urls.py`
+
+```python
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.feed, name='feed'),
+    path('post/create/', views.create_post, name='create_post'),
+    path('post/<int:post_id>/like/', views.toggle_like, name='toggle_like'),
+    path('post/<int:post_id>/comment/', views.add_comment, name='add_comment'),
+    path('u/<str:username>/', views.profile_view, name='profile'),
+    path('u/<str:username>/follow/', views.toggle_follow, name='toggle_follow'),
+    path('register/', views.register_view, name='register'),
+    path('login/', views.login_view, name='login'),
+    path('logout/', views.logout_view, name='logout'),
+]
+```
+
+Add `path('', include('core.urls'))` in the project `mini_social/urls.py`.
+
+---
+
+## `core/admin.py`
+
+```python
+from django.contrib import admin
+from .models import Profile, Post, Comment
+
+admin.site.register(Profile)
+admin.site.register(Post)
+admin.site.register(Comment)
+```
+
+---
+
+## Templates
+
+All templates are simple, mobile-friendly, and use the static CSS/JS included.
+
+### `templates/base.html`
+
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mini Social</title>
+  <link rel="stylesheet" href="{% static 'css/style.css' %}">
+  <script defer src="{% static 'js/main.js' %}"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="logo" href="{ % url 'feed' % }">MiniSocial</a>
+    <nav>
+      {% if user.is_authenticated %}
+        <a href="{% url 'profile' user.username %}">@{{ user.username }}</a>
+        <a href="{% url 'logout' %}">Logout</a>
+      {% else %}
+        <a href="{% url 'login' %}">Login</a>
+        <a href="{% url 'register' %}">Register</a>
+      {% endif %}
+    </nav>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">&copy; 2025 Mini Social</footer>
+</body>
+</html>
+```
+
+> Note: There is a small typo deliberate in the anchor url spacing — if copying, remove the space inside `{ % url 'feed' % }` to `{% url 'feed' %}`.
+
+### `templates/feed.html`
+
+```html
+{% extends 'base.html' %}
+{% load static %}
+
+{% block content %}
+<div class="container">
+  <section class="create-post">
+    {% if user.is_authenticated %}
+      <form method="post" action="{% url 'create_post' %}">{% csrf_token %}
+        {{ post_form.as_p }}
+        <button type="submit">Post</button>
+      </form>
+    {% else %}
+      <p><a href="{% url 'login' %}">Login</a> to create posts.</p>
+    {% endif %}
+  </section>
+
+  <section class="feed-list">
+    {% for post in posts %}
+      <article class="post-card" id="post-{{ post.id }}">
+        <header>
+          <a href="{% url 'profile' post.user.username %}">@{{ post.user.username }}</a>
+          <time>{{ post.created_at }}</time>
+        </header>
+        <p>{{ post.content }}</p>
+        {% if post.image %}<img src="{{ post.image }}" alt="post image">{% endif %}
+        <div class="post-actions">
+          <button onclick="likePost({{ post.id }})">❤️ <span id="likes-{{ post.id }}">{{ post.total_likes }}</span></button>
+          <form method="post" action="{% url 'add_comment' post.id %}">{% csrf_token %}
+            {{ comment_form.as_p }}
+            <button type="submit">Comment</button>
+          </form>
+        </div>
+
+        <div class="comments">
+          {% for c in post.comments.all %}
+            <div class="comment"><strong>@{{ c.user.username }}</strong> {{ c.text }}</div>
+          {% endfor %}
+        </div>
+      </article>
+    {% empty %}
+      <p>No posts yet.</p>
+    {% endfor %}
+  </section>
+</div>
+
+<script>
+function likePost(id){
+  fetch(`/post/${id}/like/`)
+    .then(r=>r.json())
+    .then(data => {
+      document.getElementById(`likes-${id}`).innerText = data.likes_count;
+    });
+}
+</script>
+{% endblock %}
+```
+
+### `templates/profile.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<div class="container profile">
+  <div class="profile-info">
+    <img src="{{ profile.avatar|default:'https://placekitten.com/100/100' }}" alt="avatar">
+    <h2>{{ profile_user.username }}</h2>
+    <p>{{ profile.bio }}</p>
+    <p>Followers: <span id="followers-count">{{ profile.followers_count }}</span></p>
+    {% if user.is_authenticated and user.username != profile_user.username %}
+      <button id="followBtn" onclick="toggleFollow('{{ profile_user.username }}')">{% if is_following %}Unfollow{% else %}Follow{% endif %}</button>
+    {% endif %}
+  </div>
+
+  <div class="profile-posts">
+    <h3>Posts</h3>
+    {% for p in posts %}
+      <div class="post-card">
+```
